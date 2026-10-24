@@ -12,6 +12,7 @@ impl PropertiesPanel {
         project: &mut CertificateProject,
         selected_element_id: &mut Option<Uuid>,
         available_fonts: &[String],
+        available_csv_columns: &[String],
     ) {
         ui.heading("Properties");
         ui.separator();
@@ -54,7 +55,7 @@ impl PropertiesPanel {
         // Element properties
         if let Some(id) = *selected_element_id {
             if let Some(elem) = project.get_element_mut(&id) {
-                Self::show_element_properties(ui, elem, available_fonts);
+                Self::show_element_properties(ui, elem, available_fonts, available_csv_columns);
 
                 ui.add_space(10.0);
                 if ui.button("🗑 Delete Element").clicked() {
@@ -86,7 +87,12 @@ impl PropertiesPanel {
         });
     }
 
-    fn show_element_properties(ui: &mut Ui, elem: &mut TextElement, available_fonts: &[String]) {
+    fn show_element_properties(
+        ui: &mut Ui,
+        elem: &mut TextElement,
+        available_fonts: &[String],
+        available_csv_columns: &[String],
+    ) {
         ui.heading("Text Element");
         ui.add_space(4.0);
 
@@ -95,7 +101,7 @@ impl PropertiesPanel {
             ui.text_edit_singleline(&mut elem.name);
         });
 
-        ui.label("Content:");
+        ui.label("Content (supports {{key}}):");
         ui.text_edit_multiline(&mut elem.text);
 
         ui.add_space(4.0);
@@ -159,15 +165,45 @@ impl PropertiesPanel {
 
         ui.add_space(4.0);
         ui.collapsing("Dynamic Binding (CSV)", |ui| {
-            ui.label("Placeholder Key (e.g. name):");
-            let mut key = elem.field_key.clone().unwrap_or_default();
-            if ui.text_edit_singleline(&mut key).changed() {
-                elem.field_key = if key.trim().is_empty() {
-                    None
-                } else {
-                    Some(key.trim().to_string())
-                };
+            if !available_csv_columns.is_empty() {
+                ui.label("Map to CSV Column:");
+                let current_col = elem.field_key.clone().unwrap_or_else(|| "None".to_string());
+                egui::ComboBox::from_id_salt("csv_col_picker")
+                    .selected_text(&current_col)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(elem.field_key.is_none(), "None").clicked() {
+                            elem.field_key = None;
+                        }
+                        for col in available_csv_columns {
+                            let is_sel = elem.field_key.as_ref() == Some(col);
+                            if ui.selectable_label(is_sel, col).clicked() {
+                                elem.field_key = Some(col.clone());
+                            }
+                        }
+                    });
+
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Insert tag:");
+                    for col in available_csv_columns {
+                        let btn_label = format!("+ {{{{{}}}}}", col);
+                        if ui.small_button(btn_label).clicked() {
+                            elem.text.push_str(&format!(" {{{{{}}}}}", col));
+                        }
+                    }
+                });
+            } else {
+                ui.label("Custom Placeholder Key:");
+                let mut key = elem.field_key.clone().unwrap_or_default();
+                if ui.text_edit_singleline(&mut key).changed() {
+                    elem.field_key = if key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(key.trim().to_string())
+                    };
+                }
             }
+
             if let Some(ref k) = elem.field_key {
                 ui.label(
                     egui::RichText::new(format!("Bound to {{{{{}}}}}", k))
@@ -178,4 +214,3 @@ impl PropertiesPanel {
         });
     }
 }
-

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use eframe::egui::{self, Color32, Panel, CentralPanel, RichText, TextureHandle, Ui};
+use eframe::egui::{self, Color32, Panel, CentralPanel, RichText, TextureHandle, Ui, Window};
 use uuid::Uuid;
 
+use crate::data::csv_import::CsvDataset;
+use crate::data::field_mapping::extract_placeholders;
 use crate::editor::canvas::CertificateCanvas;
 use crate::editor::history::ProjectHistory;
 use crate::editor::interactions::{CanvasTransform, InteractionMode};
@@ -25,6 +28,11 @@ pub struct CertificateStudioApp {
     pub bg_dimensions: Option<(u32, u32)>,
     pub status_message: String,
     pub fit_requested: bool,
+    // Milestone 4: CSV Data & Personalization
+    pub csv_dataset: Option<CsvDataset>,
+    pub preview_record_idx: Option<usize>,
+    pub show_csv_table_window: bool,
+    pub validation_summary: Option<String>,
 }
 
 impl Default for CertificateStudioApp {
@@ -43,6 +51,10 @@ impl Default for CertificateStudioApp {
             bg_dimensions: None,
             status_message: "Ready. Import a background image or add text to begin.".to_string(),
             fit_requested: false,
+            csv_dataset: None,
+            preview_record_idx: None,
+            show_csv_table_window: false,
+            validation_summary: None,
         }
     }
 }
@@ -60,6 +72,7 @@ impl CertificateStudioApp {
         self.bg_dimensions = None;
         self.selected_element_id = None;
         self.is_dirty = false;
+        self.validation_summary = None;
         self.status_message = "Created new project.".to_string();
     }
 
@@ -243,6 +256,84 @@ impl CertificateStudioApp {
         }
     }
 
+    /// Open native file dialog to import a CSV dataset
+    pub fn import_csv(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Import CSV Dataset")
+            .add_filter("CSV Files (*.csv)", &["csv"]);
+
+        if let Some(path) = dialog.pick_file() {
+            match CsvDataset::parse_from_path(&path) {
+                Ok(dataset) => {
+                    let total = dataset.total_records();
+                    let cols = dataset.headers.len();
+                    let fname = dataset.filename.clone();
+                    self.preview_record_idx = if total > 0 { Some(0) } else { None };
+                    self.csv_dataset = Some(dataset);
+                    self.validation_summary = None;
+                    self.status_message = format!("Imported CSV '{}': {} records, {} columns", fname, total, cols);
+                }
+                Err(err) => {
+                    self.status_message = format!("CSV Import Error: {}", err);
+                }
+            }
+        }
+    }
+
+    pub fn validate_current_dataset(&mut self) {
+        if let Some(ref dataset) = self.csv_dataset {
+            // Collect all required placeholder keys and field bindings from project
+            let mut required_keys = Vec::new();
+            for elem in &self.project.elements {
+                if let Some(ref k) = elem.field_key {
+                    if !required_keys.contains(k) {
+                        required_keys.push(k.clone());
+                    }
+                }
+                for placeholder in extract_placeholders(&elem.text) {
+                    if !required_keys.contains(&placeholder) {
+                        required_keys.push(placeholder);
+                    }
+                }
+            }
+
+            if required_keys.is_empty() {
+                self.validation_summary = Some("No dynamic fields bound yet. Bind text elements to CSV columns to test records.".to_string());
+                return;
+            }
+
+            let failures = dataset.validate_required_keys(&required_keys);
+            if failures.is_empty() {
+                self.validation_summary = Some(format!(
+                    "✅ All {} records valid! All bound fields ({}) are present.",
+                    dataset.total_records(),
+                    required_keys.join(", ")
+                ));
+            } else {
+                let first_few = failures
+                    .iter()
+                    .take(3)
+                    .map(|(row, missing)| format!("Row {}: missing [{}]", row, missing.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.validation_summary = Some(format!(
+                    "⚠️ {} of {} records have missing values: {}{}",
+                    failures.len(),
+                    dataset.total_records(),
+                    first_few,
+                    if failures.len() > 3 { "..." } else { "" }
+                ));
+            }
+        }
+    }
+
+    /// Retrieve the currently selected CSV record for canvas live preview
+    pub fn current_preview_record(&self) -> Option<HashMap<String, String>> {
+        let idx = self.preview_record_idx?;
+        let dataset = self.csv_dataset.as_ref()?;
+        dataset.row_as_map(idx)
+    }
+
     pub fn add_sample_text(&mut self) {
         self.history.push_snapshot(&self.project);
         self.is_dirty = true;
@@ -347,6 +438,35 @@ impl eframe::App for CertificateStudioApp {
 
                 ui.separator();
 
+                // Live recipient preview switcher in toolbar
+                if let Some(ref ds) = self.csv_dataset {
+                    let total = ds.total_records();
+                    if total > 0 {
+                        ui.label(RichText::new("Preview Recipient:").strong());
+                        let current_idx = self.preview_record_idx.unwrap_or(0);
+
+                        if ui.button("◀").on_hover_text("Previous recipient record").clicked() {
+                            let next_idx = if current_idx == 0 { total - 1 } else { current_idx - 1 };
+                            self.preview_record_idx = Some(next_idx);
+                        }
+
+                        let preview_label = format!("{}/{}", current_idx + 1, total);
+                        ui.label(RichText::new(preview_label).color(Color32::from_rgb(120, 200, 255)));
+
+                        if ui.button("▶").on_hover_text("Next recipient record").clicked() {
+                            let next_idx = (current_idx + 1) % total;
+                            self.preview_record_idx = Some(next_idx);
+                        }
+
+                        let mut is_previewing = self.preview_record_idx.is_some();
+                        if ui.checkbox(&mut is_previewing, "Live Canvas").clicked() {
+                            self.preview_record_idx = if is_previewing { Some(0) } else { None };
+                        }
+
+                        ui.separator();
+                    }
+                }
+
                 // Zoom controls
                 if ui.button("➖ Zoom -").clicked() {
                     self.transform.zoom = (self.transform.zoom * 0.85).max(0.1);
@@ -401,6 +521,13 @@ impl eframe::App for CertificateStudioApp {
                                 .color(Color32::from_gray(150)),
                         );
                     }
+                    if let Some(ref ds) = self.csv_dataset {
+                        ui.label(
+                            RichText::new(format!("📊 CSV: {} records", ds.total_records()))
+                                .size(12.0)
+                                .color(Color32::from_rgb(120, 200, 120)),
+                        );
+                    }
                 });
             });
         });
@@ -408,8 +535,8 @@ impl eframe::App for CertificateStudioApp {
         // --- 3. Left Sidebar ---
         Panel::left("left_sidebar")
             .resizable(true)
-            .default_size(230.0)
-            .size_range(190.0..=360.0)
+            .default_size(240.0)
+            .size_range(200.0..=380.0)
             .show(ui, |ui| {
                 ui.heading("Design Assets");
                 ui.separator();
@@ -473,6 +600,44 @@ impl eframe::App for CertificateStudioApp {
                     }
                 }
 
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Milestone 4: Participant Data (CSV) section
+                ui.label(RichText::new("Participant Data (CSV)").strong());
+                ui.add_space(2.0);
+
+                if let Some(ref ds) = self.csv_dataset {
+                    ui.label(RichText::new(format!("📄 {}", ds.filename)).size(11.0).color(Color32::from_rgb(120, 200, 120)));
+                    ui.label(RichText::new(format!("{} records, {} columns", ds.total_records(), ds.headers.len())).size(11.0).color(Color32::from_gray(140)));
+
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 View Table").on_hover_text("Open interactive CSV data table").clicked() {
+                            self.show_csv_table_window = true;
+                        }
+                        if ui.button("⚠️ Validate").on_hover_text("Check for empty or missing values").clicked() {
+                            self.validate_current_dataset();
+                        }
+                    });
+
+                    if let Some(ref summary) = self.validation_summary {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(summary).size(11.0));
+                    }
+
+                    if ui.button("Clear CSV").clicked() {
+                        self.csv_dataset = None;
+                        self.preview_record_idx = None;
+                        self.validation_summary = None;
+                        self.status_message = "Cleared CSV dataset.".to_string();
+                    }
+                } else {
+                    if ui.button("📊 Import CSV Dataset").on_hover_text("Load participant data (e.g. name, event, id)").clicked() {
+                        self.import_csv();
+                    }
+                    ui.label(RichText::new("No CSV loaded").size(11.0).italics().color(Color32::from_gray(140)));
+                }
+
                 ui.add_space(12.0);
                 ui.separator();
                 ui.heading("Elements");
@@ -514,15 +679,22 @@ impl eframe::App for CertificateStudioApp {
         // --- 4. Right Sidebar: Properties ---
         Panel::right("right_sidebar")
             .resizable(true)
-            .default_size(260.0)
-            .size_range(220.0..=400.0)
+            .default_size(270.0)
+            .size_range(220.0..=420.0)
             .show(ui, |ui| {
                 let available_fonts = self.font_manager.available_fonts();
+                let available_csv_cols = self
+                    .csv_dataset
+                    .as_ref()
+                    .map(|d| d.headers.clone())
+                    .unwrap_or_default();
+
                 PropertiesPanel::show(
                     ui,
                     &mut self.project,
                     &mut self.selected_element_id,
                     &available_fonts,
+                    &available_csv_cols,
                 );
             });
 
@@ -537,6 +709,8 @@ impl eframe::App for CertificateStudioApp {
                 self.fit_requested = false;
             }
 
+            let active_record = self.current_preview_record();
+
             CertificateCanvas::show(
                 ui,
                 &mut self.project,
@@ -545,8 +719,60 @@ impl eframe::App for CertificateStudioApp {
                 &mut self.selected_element_id,
                 &mut self.interaction_mode,
                 &mut self.history,
+                active_record.as_ref(),
                 &mut self.status_hover_coord_mm,
             );
         });
+
+        // --- 6. CSV Data Table Modal Window ---
+        if self.show_csv_table_window {
+            let mut is_open = self.show_csv_table_window;
+            let ds_opt = self.csv_dataset.clone();
+
+            Window::new("CSV Dataset Preview")
+                .open(&mut is_open)
+                .default_size([700.0, 400.0])
+                .show(&ctx, |ui| {
+                    if let Some(ref ds) = ds_opt {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("File: {}", ds.filename)).strong());
+                            ui.label(format!("({} records, {} columns)", ds.total_records(), ds.headers.len()));
+                        });
+                        ui.separator();
+
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            egui::Grid::new("csv_preview_grid")
+                                .striped(true)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("#").strong());
+                                    for h in &ds.headers {
+                                        ui.label(RichText::new(h).strong().color(Color32::from_rgb(120, 180, 240)));
+                                    }
+                                    ui.end_row();
+
+                                    for (i, row) in ds.rows.iter().enumerate() {
+                                        let is_current = self.preview_record_idx == Some(i);
+                                        let num_label = if is_current {
+                                            RichText::new(format!("▶ {}", i + 1)).strong().color(Color32::from_rgb(100, 220, 100))
+                                        } else {
+                                            RichText::new(format!("{}", i + 1)).color(Color32::from_gray(160))
+                                        };
+
+                                        if ui.selectable_label(is_current, num_label).on_hover_text("Click to preview on canvas").clicked() {
+                                            self.preview_record_idx = Some(i);
+                                        }
+
+                                        for cell in row {
+                                            ui.label(cell);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                });
+            self.show_csv_table_window = is_open;
+        }
     }
 }

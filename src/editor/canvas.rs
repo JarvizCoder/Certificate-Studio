@@ -19,6 +19,7 @@ impl CertificateCanvas {
         selected_element_id: &mut Option<Uuid>,
         interaction_mode: &mut InteractionMode,
         history: &mut ProjectHistory,
+        active_record: Option<&std::collections::HashMap<String, String>>,
         status_hover_coord_mm: &mut Option<[f32; 2]>,
     ) {
         let (response, painter) = ui.allocate_painter(
@@ -288,7 +289,17 @@ impl CertificateCanvas {
                 TextAlignment::Right => Pos2::new(elem_rect.right() - 4.0, elem_rect.center().y),
             };
 
-            painter.text(anchor, text_align, &element.text, font_id, text_color);
+            let display_text = if let Some(record) = active_record {
+                crate::data::field_mapping::resolve_text_for_record(
+                    &element.text,
+                    element.field_key.as_deref(),
+                    record,
+                )
+            } else {
+                element.text.clone()
+            };
+
+            painter.text(anchor, text_align, &display_text, font_id, text_color);
         }
 
         // 3. Initiate drag / resize on mouse press
