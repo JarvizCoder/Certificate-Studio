@@ -8,10 +8,13 @@ use crate::editor::interactions::{CanvasTransform, InteractionMode};
 use crate::editor::properties::PropertiesPanel;
 use crate::fonts::manager::FontManager;
 use crate::model::element::TextElement;
+use crate::model::persistence::{load_project_bundle, save_project_bundle};
 use crate::model::project::CertificateProject;
 
 pub struct CertificateStudioApp {
     pub project: CertificateProject,
+    pub current_project_path: Option<PathBuf>,
+    pub is_dirty: bool,
     pub history: ProjectHistory,
     pub transform: CanvasTransform,
     pub font_manager: FontManager,
@@ -28,6 +31,8 @@ impl Default for CertificateStudioApp {
     fn default() -> Self {
         Self {
             project: CertificateProject::default(),
+            current_project_path: None,
+            is_dirty: false,
             history: ProjectHistory::default(),
             transform: CanvasTransform::default(),
             font_manager: FontManager::default(),
@@ -47,6 +52,124 @@ impl CertificateStudioApp {
         Self::default()
     }
 
+    pub fn new_project(&mut self) {
+        self.history.clear();
+        self.project = CertificateProject::default();
+        self.current_project_path = None;
+        self.bg_texture = None;
+        self.bg_dimensions = None;
+        self.selected_element_id = None;
+        self.is_dirty = false;
+        self.status_message = "Created new project.".to_string();
+    }
+
+    pub fn save_project(&mut self) {
+        if let Some(ref path) = self.current_project_path.clone() {
+            match save_project_bundle(&self.project, path, &self.font_manager) {
+                Ok(()) => {
+                    self.is_dirty = false;
+                    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("project");
+                    self.status_message = format!("Saved project to '{}'", fname);
+                }
+                Err(err) => {
+                    self.status_message = format!("Failed to save project: {}", err);
+                }
+            }
+        } else {
+            self.save_project_as();
+        }
+    }
+
+    pub fn save_project_as(&mut self) {
+        let suggested_name = format!("{}.certproj", self.project.name.to_lowercase().replace(' ', "_"));
+        let dialog = rfd::FileDialog::new()
+            .set_title("Save Certificate Project As")
+            .set_file_name(&suggested_name)
+            .add_filter("Certificate Project (*.certproj)", &["certproj", "json"]);
+
+        if let Some(path) = dialog.save_file() {
+            match save_project_bundle(&self.project, &path, &self.font_manager) {
+                Ok(()) => {
+                    self.current_project_path = Some(path.clone());
+                    self.is_dirty = false;
+                    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("project");
+                    self.status_message = format!("Saved project to '{}'", fname);
+                }
+                Err(err) => {
+                    self.status_message = format!("Failed to save project: {}", err);
+                }
+            }
+        }
+    }
+
+    pub fn open_project(&mut self, ctx: &egui::Context) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Open Certificate Project")
+            .add_filter("Certificate Project (*.certproj, *.json)", &["certproj", "json"]);
+
+        if let Some(path) = dialog.pick_file() {
+            match load_project_bundle(&path) {
+                Ok(loaded) => {
+                    self.project = loaded.project;
+                    self.current_project_path = Some(path.clone());
+                    self.selected_element_id = None;
+                    self.history.clear();
+                    self.is_dirty = false;
+
+                    // Restore background image if present
+                    if let Some(bytes) = loaded.background_bytes {
+                        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                            let (w, h) = (dyn_img.width(), dyn_img.height());
+                            let rgba = dyn_img.to_rgba8();
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                rgba.as_flat_samples().as_slice(),
+                            );
+                            let texture = ctx.load_texture(
+                                "certificate_bg",
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.bg_texture = Some(texture);
+                            self.bg_dimensions = Some((w, h));
+                        }
+                    } else {
+                        self.bg_texture = None;
+                        self.bg_dimensions = None;
+                    }
+
+                    // Restore custom fonts
+                    for (font_name, (font_path, font_bytes)) in loaded.fonts {
+                        self.font_manager.loaded_fonts.insert(
+                            font_name.clone(),
+                            crate::fonts::manager::CustomFontEntry {
+                                name: font_name,
+                                path: font_path,
+                                bytes: font_bytes,
+                            },
+                        );
+                    }
+                    self.font_manager.sync_with_egui(ctx);
+
+                    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("project");
+                    if !loaded.warnings.is_empty() {
+                        self.status_message = format!(
+                            "Opened '{}' with {} warnings: {}",
+                            fname,
+                            loaded.warnings.len(),
+                            loaded.warnings.join("; ")
+                        );
+                    } else {
+                        self.status_message = format!("Opened project '{}'", fname);
+                    }
+                }
+                Err(err) => {
+                    self.status_message = format!("Failed to open project: {}", err);
+                }
+            }
+        }
+    }
+
     /// Open native file dialog to import a background certificate image (PNG / JPG)
     pub fn import_background(&mut self, ctx: &egui::Context) {
         let dialog = rfd::FileDialog::new()
@@ -55,6 +178,7 @@ impl CertificateStudioApp {
 
         if let Some(path) = dialog.pick_file() {
             self.history.push_snapshot(&self.project);
+            self.is_dirty = true;
             self.load_background_from_path(ctx, path);
         }
     }
@@ -109,6 +233,7 @@ impl CertificateStudioApp {
         if let Some(path) = dialog.pick_file() {
             match self.font_manager.load_font_from_path(&path, ctx) {
                 Ok(font_name) => {
+                    self.is_dirty = true;
                     self.status_message = format!("Successfully imported font '{}'", font_name);
                 }
                 Err(err) => {
@@ -120,6 +245,7 @@ impl CertificateStudioApp {
 
     pub fn add_sample_text(&mut self) {
         self.history.push_snapshot(&self.project);
+        self.is_dirty = true;
         let count = self.project.elements.len() + 1;
         let x = (self.project.width_mm - 120.0) / 2.0;
         let y = 50.0 + (count as f32 * 15.0).min(self.project.height_mm - 60.0);
@@ -139,9 +265,10 @@ impl eframe::App for CertificateStudioApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Keyboard shortcuts for Undo (Ctrl+Z) and Redo (Ctrl+Y or Ctrl+Shift+Z)
+        // Keyboard shortcuts
         if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift) {
             if self.history.undo(&mut self.project) {
+                self.is_dirty = true;
                 self.status_message = "Undo".to_string();
             }
         }
@@ -150,31 +277,51 @@ impl eframe::App for CertificateStudioApp {
                 || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
         }) {
             if self.history.redo(&mut self.project) {
+                self.is_dirty = true;
                 self.status_message = "Redo".to_string();
             }
+        }
+        if ui.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project();
+        }
+        if ui.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+            self.save_project_as();
+        }
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.open_project(&ctx);
+        }
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+            self.new_project();
         }
 
         // --- 1. Top Toolbar ---
         Panel::top("top_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Certificate Studio");
+
+                let title_text = format!(
+                    " - {}{}",
+                    self.project.name,
+                    if self.is_dirty { " *" } else { "" }
+                );
+                ui.label(RichText::new(title_text).strong().color(Color32::from_rgb(180, 210, 240)));
+
                 ui.separator();
 
-                if ui.button("📄 New").on_hover_text("Start a fresh certificate project").clicked() {
-                    self.history.push_snapshot(&self.project);
-                    self.project = CertificateProject::default();
-                    self.bg_texture = None;
-                    self.bg_dimensions = None;
-                    self.selected_element_id = None;
-                    self.status_message = "Created new project.".to_string();
+                if ui.button("📄 New").on_hover_text("Start a fresh certificate project (Ctrl+N)").clicked() {
+                    self.new_project();
                 }
 
-                if ui.button("📂 Open").on_hover_text("Open saved project (Milestone 3)").clicked() {
-                    self.status_message = "Project loading will be activated in Milestone 3.".to_string();
+                if ui.button("📂 Open").on_hover_text("Open saved project bundle (Ctrl+O)").clicked() {
+                    self.open_project(&ctx);
                 }
 
-                if ui.button("💾 Save").on_hover_text("Save project (Milestone 3)").clicked() {
-                    self.status_message = "Project saving will be activated in Milestone 3.".to_string();
+                if ui.button("💾 Save").on_hover_text("Save project (Ctrl+S)").clicked() {
+                    self.save_project();
+                }
+
+                if ui.button("💾 Save As...").on_hover_text("Save project as a new bundle (Ctrl+Shift+S)").clicked() {
+                    self.save_project_as();
                 }
 
                 ui.separator();
@@ -183,6 +330,7 @@ impl eframe::App for CertificateStudioApp {
                 ui.add_enabled_ui(self.history.can_undo(), |ui| {
                     if ui.button("⮌ Undo").on_hover_text("Undo change (Ctrl+Z)").clicked() {
                         if self.history.undo(&mut self.project) {
+                            self.is_dirty = true;
                             self.status_message = "Undo".to_string();
                         }
                     }
@@ -191,6 +339,7 @@ impl eframe::App for CertificateStudioApp {
                 ui.add_enabled_ui(self.history.can_redo(), |ui| {
                     if ui.button("⮎ Redo").on_hover_text("Redo change (Ctrl+Y)").clicked() {
                         if self.history.redo(&mut self.project) {
+                            self.is_dirty = true;
                             self.status_message = "Redo".to_string();
                         }
                     }
@@ -244,6 +393,14 @@ impl eframe::App for CertificateStudioApp {
                                 .color(Color32::from_gray(140)),
                         );
                     }
+                    if let Some(ref path) = self.current_project_path {
+                        let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("project");
+                        ui.label(
+                            RichText::new(format!("📁 {}", fname))
+                                .size(12.0)
+                                .color(Color32::from_gray(150)),
+                        );
+                    }
                 });
             });
         });
@@ -276,6 +433,7 @@ impl eframe::App for CertificateStudioApp {
                     }
                     if ui.button("Remove Background").clicked() {
                         self.history.push_snapshot(&self.project);
+                        self.is_dirty = true;
                         self.bg_texture = None;
                         self.bg_dimensions = None;
                         self.project.background_image_path = None;
@@ -309,6 +467,7 @@ impl eframe::App for CertificateStudioApp {
                         });
                     }
                     if let Some(name) = remove_font_name {
+                        self.is_dirty = true;
                         self.font_manager.remove_font(&name, &ctx);
                         self.status_message = format!("Removed font '{}'", name);
                     }
@@ -343,6 +502,7 @@ impl eframe::App for CertificateStudioApp {
                     }
                     if let Some(del_id) = delete_id {
                         self.history.push_snapshot(&self.project);
+                        self.is_dirty = true;
                         self.project.remove_element(&del_id);
                         if self.selected_element_id == Some(del_id) {
                             self.selected_element_id = None;
