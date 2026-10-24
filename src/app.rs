@@ -1,0 +1,392 @@
+use std::path::PathBuf;
+use eframe::egui::{self, Color32, Panel, CentralPanel, RichText, TextureHandle, Ui};
+use uuid::Uuid;
+
+use crate::editor::canvas::CertificateCanvas;
+use crate::editor::history::ProjectHistory;
+use crate::editor::interactions::{CanvasTransform, InteractionMode};
+use crate::editor::properties::PropertiesPanel;
+use crate::fonts::manager::FontManager;
+use crate::model::element::TextElement;
+use crate::model::project::CertificateProject;
+
+pub struct CertificateStudioApp {
+    pub project: CertificateProject,
+    pub history: ProjectHistory,
+    pub transform: CanvasTransform,
+    pub font_manager: FontManager,
+    pub selected_element_id: Option<Uuid>,
+    pub interaction_mode: InteractionMode,
+    pub status_hover_coord_mm: Option<[f32; 2]>,
+    pub bg_texture: Option<TextureHandle>,
+    pub bg_dimensions: Option<(u32, u32)>,
+    pub status_message: String,
+    pub fit_requested: bool,
+}
+
+impl Default for CertificateStudioApp {
+    fn default() -> Self {
+        Self {
+            project: CertificateProject::default(),
+            history: ProjectHistory::default(),
+            transform: CanvasTransform::default(),
+            font_manager: FontManager::default(),
+            selected_element_id: None,
+            interaction_mode: InteractionMode::default(),
+            status_hover_coord_mm: None,
+            bg_texture: None,
+            bg_dimensions: None,
+            status_message: "Ready. Import a background image or add text to begin.".to_string(),
+            fit_requested: false,
+        }
+    }
+}
+
+impl CertificateStudioApp {
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::default()
+    }
+
+    /// Open native file dialog to import a background certificate image (PNG / JPG)
+    pub fn import_background(&mut self, ctx: &egui::Context) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select Certificate Background Image")
+            .add_filter("Image Files", &["png", "jpg", "jpeg", "webp", "bmp"]);
+
+        if let Some(path) = dialog.pick_file() {
+            self.history.push_snapshot(&self.project);
+            self.load_background_from_path(ctx, path);
+        }
+    }
+
+    pub fn load_background_from_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match image::load_from_memory(&bytes) {
+                Ok(dyn_img) => {
+                    let (w, h) = (dyn_img.width(), dyn_img.height());
+                    let rgba = dyn_img.to_rgba8();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_flat_samples().as_slice(),
+                    );
+
+                    let texture = ctx.load_texture(
+                        "certificate_bg",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+
+                    self.bg_texture = Some(texture);
+                    self.bg_dimensions = Some((w, h));
+                    self.project.background_image_path = Some(path.clone());
+
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image");
+
+                    self.status_message = format!(
+                        "Loaded background '{}' ({} × {} px)",
+                        file_name, w, h
+                    );
+                }
+                Err(err) => {
+                    self.status_message = format!("Failed to decode image: {}", err);
+                }
+            },
+            Err(err) => {
+                self.status_message = format!("Failed to read file: {}", err);
+            }
+        }
+    }
+
+    /// Open native file dialog to import custom TTF or OTF fonts
+    pub fn import_font(&mut self, ctx: &egui::Context) {
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select Font File")
+            .add_filter("TrueType & OpenType Fonts", &["ttf", "otf"]);
+
+        if let Some(path) = dialog.pick_file() {
+            match self.font_manager.load_font_from_path(&path, ctx) {
+                Ok(font_name) => {
+                    self.status_message = format!("Successfully imported font '{}'", font_name);
+                }
+                Err(err) => {
+                    self.status_message = format!("Font import error: {}", err);
+                }
+            }
+        }
+    }
+
+    pub fn add_sample_text(&mut self) {
+        self.history.push_snapshot(&self.project);
+        let count = self.project.elements.len() + 1;
+        let x = (self.project.width_mm - 120.0) / 2.0;
+        let y = 50.0 + (count as f32 * 15.0).min(self.project.height_mm - 60.0);
+        let new_elem = TextElement::new_default(
+            format!("Text Element {}", count),
+            "Certificate of Excellence",
+            [x, y],
+        );
+        let id = new_elem.id;
+        self.project.add_element(new_elem);
+        self.selected_element_id = Some(id);
+        self.status_message = format!("Added text element {}", count);
+    }
+}
+
+impl eframe::App for CertificateStudioApp {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // Keyboard shortcuts for Undo (Ctrl+Z) and Redo (Ctrl+Y or Ctrl+Shift+Z)
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift) {
+            if self.history.undo(&mut self.project) {
+                self.status_message = "Undo".to_string();
+            }
+        }
+        if ui.input(|i| {
+            (i.modifiers.command && i.key_pressed(egui::Key::Y))
+                || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
+        }) {
+            if self.history.redo(&mut self.project) {
+                self.status_message = "Redo".to_string();
+            }
+        }
+
+        // --- 1. Top Toolbar ---
+        Panel::top("top_toolbar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Certificate Studio");
+                ui.separator();
+
+                if ui.button("📄 New").on_hover_text("Start a fresh certificate project").clicked() {
+                    self.history.push_snapshot(&self.project);
+                    self.project = CertificateProject::default();
+                    self.bg_texture = None;
+                    self.bg_dimensions = None;
+                    self.selected_element_id = None;
+                    self.status_message = "Created new project.".to_string();
+                }
+
+                if ui.button("📂 Open").on_hover_text("Open saved project (Milestone 3)").clicked() {
+                    self.status_message = "Project loading will be activated in Milestone 3.".to_string();
+                }
+
+                if ui.button("💾 Save").on_hover_text("Save project (Milestone 3)").clicked() {
+                    self.status_message = "Project saving will be activated in Milestone 3.".to_string();
+                }
+
+                ui.separator();
+
+                // Undo / Redo controls
+                ui.add_enabled_ui(self.history.can_undo(), |ui| {
+                    if ui.button("⮌ Undo").on_hover_text("Undo change (Ctrl+Z)").clicked() {
+                        if self.history.undo(&mut self.project) {
+                            self.status_message = "Undo".to_string();
+                        }
+                    }
+                });
+
+                ui.add_enabled_ui(self.history.can_redo(), |ui| {
+                    if ui.button("⮎ Redo").on_hover_text("Redo change (Ctrl+Y)").clicked() {
+                        if self.history.redo(&mut self.project) {
+                            self.status_message = "Redo".to_string();
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Zoom controls
+                if ui.button("➖ Zoom -").clicked() {
+                    self.transform.zoom = (self.transform.zoom * 0.85).max(0.1);
+                }
+                ui.label(format!("{:.0}%", self.transform.zoom * 100.0));
+                if ui.button("➕ Zoom +").clicked() {
+                    self.transform.zoom = (self.transform.zoom * 1.15).min(5.0);
+                }
+                if ui.button("100%").clicked() {
+                    self.transform.zoom = 1.0;
+                    self.transform.pan = egui::Vec2::ZERO;
+                }
+                if ui.button("🔍 Fit").on_hover_text("Fit certificate to current view").clicked() {
+                    self.fit_requested = true;
+                }
+
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "Size: {:.0} × {:.0} mm",
+                        self.project.width_mm, self.project.height_mm
+                    ))
+                    .color(Color32::from_gray(160)),
+                );
+            });
+        });
+
+        // --- 2. Bottom Status Bar ---
+        Panel::bottom("bottom_status_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&self.status_message).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some([x, y]) = self.status_hover_coord_mm {
+                        ui.label(
+                            RichText::new(format!("X: {:.1} mm | Y: {:.1} mm", x, y))
+                                .size(12.0)
+                                .color(Color32::from_rgb(100, 180, 240)),
+                        );
+                    }
+                    if let Some((w, h)) = self.bg_dimensions {
+                        ui.label(
+                            RichText::new(format!("BG: {}×{} px", w, h))
+                                .size(12.0)
+                                .color(Color32::from_gray(140)),
+                        );
+                    }
+                });
+            });
+        });
+
+        // --- 3. Left Sidebar ---
+        Panel::left("left_sidebar")
+            .resizable(true)
+            .default_size(230.0)
+            .size_range(190.0..=360.0)
+            .show(ui, |ui| {
+                ui.heading("Design Assets");
+                ui.separator();
+
+                ui.label(RichText::new("Background Image").strong());
+                ui.add_space(2.0);
+                if ui
+                    .button("🖼 Import Background")
+                    .on_hover_text("Load a certificate background image (PNG, JPG)")
+                    .clicked()
+                {
+                    self.import_background(&ctx);
+                }
+
+                if let Some(ref path) = self.project.background_image_path {
+                    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("image");
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(format!("File: {}", fname)).size(11.0).color(Color32::from_rgb(120, 200, 120)));
+                    if let Some((w, h)) = self.bg_dimensions {
+                        ui.label(RichText::new(format!("Dimensions: {} × {} px", w, h)).size(11.0).color(Color32::from_gray(140)));
+                    }
+                    if ui.button("Remove Background").clicked() {
+                        self.history.push_snapshot(&self.project);
+                        self.bg_texture = None;
+                        self.bg_dimensions = None;
+                        self.project.background_image_path = None;
+                        self.status_message = "Background image removed.".to_string();
+                    }
+                } else {
+                    ui.label(RichText::new("No background image loaded").size(11.0).italics().color(Color32::from_gray(140)));
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Custom Fonts section
+                ui.label(RichText::new("Custom Fonts").strong());
+                ui.add_space(2.0);
+                if ui.button("🔤 Import Font (.ttf / .otf)").clicked() {
+                    self.import_font(&ctx);
+                }
+
+                let custom_font_names: Vec<String> = self.font_manager.loaded_fonts.keys().cloned().collect();
+                if custom_font_names.is_empty() {
+                    ui.label(RichText::new("No custom fonts loaded").size(11.0).italics().color(Color32::from_gray(140)));
+                } else {
+                    let mut remove_font_name = None;
+                    for font_name in &custom_font_names {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(font_name).size(12.0));
+                            if ui.small_button("✖").on_hover_text("Remove font").clicked() {
+                                remove_font_name = Some(font_name.clone());
+                            }
+                        });
+                    }
+                    if let Some(name) = remove_font_name {
+                        self.font_manager.remove_font(&name, &ctx);
+                        self.status_message = format!("Removed font '{}'", name);
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("Elements");
+
+                ui.add_space(4.0);
+                if ui.button("➕ Add Text").clicked() {
+                    self.add_sample_text();
+                }
+
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut delete_id = None;
+                    for elem in &mut self.project.elements {
+                        let is_sel = self.selected_element_id == Some(elem.id);
+                        ui.horizontal(|ui| {
+                            let eye_label = if elem.is_visible { "👁" } else { "🚫" };
+                            if ui.small_button(eye_label).clicked() {
+                                elem.is_visible = !elem.is_visible;
+                            }
+                            if ui.selectable_label(is_sel, &elem.name).clicked() {
+                                self.selected_element_id = Some(elem.id);
+                            }
+                            if ui.small_button("🗑").on_hover_text("Delete element").clicked() {
+                                delete_id = Some(elem.id);
+                            }
+                        });
+                    }
+                    if let Some(del_id) = delete_id {
+                        self.history.push_snapshot(&self.project);
+                        self.project.remove_element(&del_id);
+                        if self.selected_element_id == Some(del_id) {
+                            self.selected_element_id = None;
+                        }
+                    }
+                });
+            });
+
+        // --- 4. Right Sidebar: Properties ---
+        Panel::right("right_sidebar")
+            .resizable(true)
+            .default_size(260.0)
+            .size_range(220.0..=400.0)
+            .show(ui, |ui| {
+                let available_fonts = self.font_manager.available_fonts();
+                PropertiesPanel::show(
+                    ui,
+                    &mut self.project,
+                    &mut self.selected_element_id,
+                    &available_fonts,
+                );
+            });
+
+        // --- 5. Center Panel: Canvas ---
+        CentralPanel::default().show(ui, |ui| {
+            if self.fit_requested {
+                self.transform.fit_to_viewport(
+                    ui.available_rect_before_wrap(),
+                    self.project.width_mm,
+                    self.project.height_mm,
+                );
+                self.fit_requested = false;
+            }
+
+            CertificateCanvas::show(
+                ui,
+                &mut self.project,
+                self.bg_texture.as_ref(),
+                &mut self.transform,
+                &mut self.selected_element_id,
+                &mut self.interaction_mode,
+                &mut self.history,
+                &mut self.status_hover_coord_mm,
+            );
+        });
+    }
+}
