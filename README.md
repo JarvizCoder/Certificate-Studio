@@ -1,4 +1,4 @@
-# Certificate Studio 🎓✨
+# Certificate Studio 
 
 A high-performance native desktop certificate designer and bulk generator written in **Rust** using **`egui` / `eframe`**.
 
@@ -6,7 +6,7 @@ Designed for educators, event organizers, and institutions to visually lay out c
 
 ---
 
-## ✨ Features
+## Features
 
 - **Native Desktop GUI**: Built directly in Rust with `egui` and `eframe` (no Electron, webviews, or browser overhead).
 - **Physical Document Coordinates**: Document layouts and positions are stored strictly in **millimeters** (`mm`), ensuring identical visual fidelity between the canvas editor, PNG exports, and PDF printouts.
@@ -19,7 +19,7 @@ Designed for educators, event organizers, and institutions to visually lay out c
 
 ---
 
-## 🚀 Getting Started
+## Building the Studio.
 
 ### Prerequisites
 
